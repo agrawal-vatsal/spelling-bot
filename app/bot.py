@@ -1,13 +1,12 @@
-from pipecat.frames.frames import LLMRunFrame
-from pipecat.runner.types import RunnerArguments
-from pipecat.runner.utils import create_transport
+from loguru import logger
+from pipecat.frames.frames import LLMMessagesAppendFrame
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
 
-from loguru import logger
-
-from app.core.config import get_settings
 from app.api.transport import get_transport_params
+from app.core.config import get_settings
 from app.pipeline import build_pipeline
 
 
@@ -22,12 +21,8 @@ async def bot(runner_args: RunnerArguments) -> None:
     # 2. Build the transport the client requested.
     transport = await create_transport(runner_args, transport_params_map)
 
-    # 3. Build the processor pipeline; context lets us trigger the greeting.
-    pipeline, context = build_pipeline(transport, settings)
+    pipeline, target_word = build_pipeline(transport, settings)
 
-    # 4. Wrap the pipeline in a task. PipelineParams configures run-time behaviour
-    #    (metrics, etc). The task is RUN BY a PipelineRunner — never call
-    #    task.run() yourself; that's the runner's job.
     task = PipelineTask(
         pipeline,
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
@@ -36,9 +31,21 @@ async def bot(runner_args: RunnerArguments) -> None:
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport_instance, client):
         logger.info(f"Client connected: {client}")
-        # Kick off the bot's opening line. The pipeline emits its own StartFrame
-        # when the runner starts the task, so we do NOT queue one here.
-        await task.queue_frames([LLMRunFrame()])
+        # Tell the host which word to present; run_llm=True makes it speak.
+        await task.queue_frames(
+            [
+                LLMMessagesAppendFrame(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": f"Greet the player warmly and present the word "
+                                       f"'{target_word}'. Ask them to spell it out.",
+                        }
+                    ],
+                    run_llm=True,
+                )
+            ]
+        )
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport_instance, client):

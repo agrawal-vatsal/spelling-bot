@@ -1,30 +1,29 @@
 from pipecat.services.google.llm import GoogleLLMService
+from pipecat.services.groq.llm import GroqLLMService
+from pipecat.services.llm_service import LLMService
 
 from app.core.config import get_settings
 
 
-def create_llm(system_prompt: str, settings=None) -> GoogleLLMService:
-    """Creates and configures a Google Gemini LLM service instance for Pipecat 1.3.0.
-
-    Args:
-        system_prompt: The instructions governing the LLM's persona and behavior.
-        settings: Optional pre-loaded settings instance; defaults to resolving via get_settings().
-    """
+def create_llm(system_prompt: str, settings=None, provider: str | None = None) -> LLMService:
     if settings is None:
         settings = get_settings()
 
-    api_key = settings.google_api_key
-    if not api_key:
-        raise ValueError("Google API Key is missing from settings.")
+    provider = (provider or "gemini").lower()
 
-    # Model configuration passed via the nested Settings object in 1.3.0
-    llm_settings = GoogleLLMService.Settings(
-        model=settings.gemini_model,
-    )
+    if provider == "groq":
+        if not settings.groq_api_key:
+            raise ValueError("GROQ_API_KEY is missing from settings.")
+        return GroqLLMService(
+            api_key=settings.groq_api_key,
+            settings=GroqLLMService.Settings(model=settings.groq_model),
+        )
 
-    # system_instruction is passed as a top-level parameter to the service initialization
+    # Default: Gemini
+    if not settings.google_api_key:
+        raise ValueError("GOOGLE_API_KEY is missing from settings.")
     return GoogleLLMService(
-        api_key=api_key,
+        api_key=settings.google_api_key,
         system_instruction=system_prompt,
-        settings=llm_settings,
+        settings=GoogleLLMService.Settings(model=settings.gemini_model),
     )

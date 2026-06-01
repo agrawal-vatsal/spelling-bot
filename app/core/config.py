@@ -31,8 +31,12 @@ class Settings(BaseSettings):
     deepgram_api_key: str = Field(..., alias="DEEPGRAM_API_KEY")
     google_api_key: str = Field(..., alias="GOOGLE_API_KEY")
 
+    # --- Provider credentials (optional) ---
+    groq_api_key: str | None = Field(None, alias="GROQ_API_KEY")
+
     # --- Model / voice selection (optional, sensible defaults) ---
     gemini_model: str = Field("gemini-2.5-flash", alias="GEMINI_MODEL")
+    groq_model: str = Field("llama-3.3-70b-versatile", alias="GROQ_MODEL")
     deepgram_voice: str = Field("aura-2-andromeda-en", alias="DEEPGRAM_VOICE")
     deepgram_stt_model: str = Field("nova-3", alias="DEEPGRAM_STT_MODEL")
 
