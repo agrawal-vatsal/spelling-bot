@@ -13,7 +13,7 @@ def create_llm(system_prompt: str, settings=None, provider: str | None = None) -
     if settings is None:
         settings = get_settings()
 
-    provider = (provider or GEMINI).lower()
+    provider = (provider or GROQ).lower()
 
     if provider not in _PROVIDERS:
         raise ValueError(f"Unknown LLM provider: {provider!r}. Use {GROQ!r} or {GEMINI!r}.")

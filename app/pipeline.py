@@ -11,7 +11,7 @@ from app.core.config import Settings
 from app.game.state import SpellBeeGame
 from app.processors.spelling_validator import SpellingValidator
 from app.prompts import SYSTEM_PROMPT
-from app.services.llm import GROQ, create_llm
+from app.services.llm import create_llm
 from app.services.stt import create_stt
 from app.services.tts import create_tts
 
@@ -24,7 +24,7 @@ def build_pipeline(transport, settings: Settings):
     """
     stt = create_stt(settings)
     tts = create_tts(settings)
-    llm = create_llm(SYSTEM_PROMPT, settings, provider=GROQ)
+    llm = create_llm(SYSTEM_PROMPT, settings)
 
     game = SpellBeeGame()
 

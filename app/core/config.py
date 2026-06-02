@@ -29,10 +29,10 @@ class Settings(BaseSettings):
 
     # --- Provider credentials (required) ---
     deepgram_api_key: str = Field(..., alias="DEEPGRAM_API_KEY")
-    google_api_key: str = Field(..., alias="GOOGLE_API_KEY")
+    groq_api_key: str = Field(..., alias="GROQ_API_KEY")
 
     # --- Provider credentials (optional) ---
-    groq_api_key: str | None = Field(None, alias="GROQ_API_KEY")
+    google_api_key: str | None = Field(None, alias="GOOGLE_API_KEY")
 
     # --- Model / voice selection (optional, sensible defaults) ---
     gemini_model: str = Field("gemini-2.5-flash", alias="GEMINI_MODEL")
