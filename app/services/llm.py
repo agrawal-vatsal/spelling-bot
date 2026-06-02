@@ -4,14 +4,21 @@ from pipecat.services.llm_service import LLMService
 
 from app.core.config import get_settings
 
+GROQ = "groq"
+GEMINI = "gemini"
+_PROVIDERS = (GROQ, GEMINI)
+
 
 def create_llm(system_prompt: str, settings=None, provider: str | None = None) -> LLMService:
     if settings is None:
         settings = get_settings()
 
-    provider = (provider or "gemini").lower()
+    provider = (provider or GEMINI).lower()
 
-    if provider == "groq":
+    if provider not in _PROVIDERS:
+        raise ValueError(f"Unknown LLM provider: {provider!r}. Use {GROQ!r} or {GEMINI!r}.")
+
+    if provider == GROQ:
         if not settings.groq_api_key:
             raise ValueError("GROQ_API_KEY is missing from settings.")
         return GroqLLMService(
@@ -19,7 +26,6 @@ def create_llm(system_prompt: str, settings=None, provider: str | None = None) -
             settings=GroqLLMService.Settings(model=settings.groq_model),
         )
 
-    # Default: Gemini
     if not settings.google_api_key:
         raise ValueError("GOOGLE_API_KEY is missing from settings.")
     return GoogleLLMService(

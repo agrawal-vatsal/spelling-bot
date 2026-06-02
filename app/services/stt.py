@@ -4,27 +4,18 @@ from app.core.config import get_settings
 
 
 def create_stt(settings=None) -> DeepgramSTTService:
-    """Creates and configures a Deepgram Speech-to-Text (STT) service instance for Pipecat 1.3.0.
-
-    Args:
-        settings: Optional pre-loaded settings instance; defaults to resolving via get_settings().
-    """
+    """Return a configured Deepgram STT service."""
     if settings is None:
         settings = get_settings()
 
-    api_key = settings.deepgram_api_key
-    if not api_key:
-        raise ValueError("Deepgram API Key is missing from settings.")
-
-    # In 1.3.0, model, language, and smart_format must be bundled into LiveOptions
-    # rather than passed as top-level kwargs to DeepgramSTTService.
-    stt_options = LiveOptions(
-        model=settings.deepgram_stt_model,  # defaults to "nova-3"
-        language="en-US",
-        smart_format=True,
-    )
+    if not settings.deepgram_api_key:
+        raise ValueError("DEEPGRAM_API_KEY is missing from settings.")
 
     return DeepgramSTTService(
-        api_key=api_key,
-        live_options=stt_options,
+        api_key=settings.deepgram_api_key,
+        live_options=LiveOptions(
+            model=settings.deepgram_stt_model,
+            language="en-US",
+            smart_format=True,
+        ),
     )

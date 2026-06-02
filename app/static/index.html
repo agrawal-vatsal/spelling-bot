@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spell Bee</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0f172a;
+      color: #f1f5f9;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.5rem;
+      padding: 1.5rem;
+    }
+    h1 { font-size: 2rem; font-weight: 700; letter-spacing: -0.02em; }
+    h1 span { color: #fbbf24; }
+
+    #status-bar { font-size: 0.85rem; color: #94a3b8; min-height: 1.2em; }
+
+    #score-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 1rem;
+      padding: 1.5rem 2.5rem;
+      text-align: center;
+      min-width: 260px;
+    }
+    .card-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #64748b;
+      margin-bottom: 0.2rem;
+    }
+    #word-progress { font-size: 2rem; font-weight: 700; color: #38bdf8; }
+    #score-value   { font-size: 1.5rem; font-weight: 600; color: #4ade80; margin-top: 0.75rem; }
+
+    .btn {
+      padding: 0.75rem 2rem;
+      border-radius: 0.5rem;
+      border: none;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn:not(:disabled):hover { opacity: 0.85; }
+    #connect-btn    { background: #38bdf8; color: #0f172a; }
+    #mute-btn       { background: #475569; color: #f1f5f9; }
+    #disconnect-btn { background: #ef4444; color: #fff; }
+    #controls { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: center; }
+
+    #finished-banner {
+      display: none;
+      background: #fbbf24; color: #0f172a;
+      font-size: 1.1rem; font-weight: 700;
+      padding: 0.75rem 2rem; border-radius: 0.5rem; text-align: center;
+    }
+
+    #speaking-dot {
+      display: inline-block; width: 0.55rem; height: 0.55rem;
+      border-radius: 50%; background: #475569; vertical-align: middle; margin-right: 0.4rem;
+    }
+    #speaking-dot.bot  { background: #38bdf8; animation: pulse 1s infinite; }
+    #speaking-dot.user { background: #4ade80; animation: pulse 0.6s infinite; }
+    @keyframes pulse {
+      0%,100% { transform: scale(1); opacity: 1; }
+      50%      { transform: scale(1.5); opacity: 0.6; }
+    }
+    #speaking-label { font-size: 0.8rem; color: #64748b; }
+
+    audio { display: none; }
+  </style>
+</head>
+<body>
+  <h1>Spell <span>Bee</span> 🐝</h1>
+  <div id="status-bar">Not connected</div>
+
+  <div id="score-card">
+    <div class="card-label">Word</div>
+    <div id="word-progress">– / –</div>
+    <div class="card-label" style="margin-top:1rem">Score</div>
+    <div id="score-value">–</div>
+  </div>
+
+  <div id="finished-banner"></div>
+
+  <div id="controls">
+    <button id="connect-btn"    class="btn">Connect</button>
+    <button id="mute-btn"       class="btn" disabled>Mute Mic</button>
+    <button id="disconnect-btn" class="btn" disabled>Disconnect</button>
+  </div>
+
+  <div>
+    <span id="speaking-dot"></span>
+    <span id="speaking-label">–</span>
+  </div>
+
+  <audio id="bot-audio" autoplay playsinline></audio>
+
+  <script type="module">
+    // -----------------------------------------------------------------
+    // Verified API (pipecat-ai 1.10.x, fetched 2026-06-02):
+    //   Class is PipecatClient (exported as 'PipecatClient'), NOT RTVIClient.
+    //   Connect via startBotAndConnect({ endpoint, requestData }).
+    //   RTVIEvent.ServerMessage callback receives data directly (e.data).
+    //   enableMic() is synchronous.
+    // -----------------------------------------------------------------
+    import { PipecatClient, RTVIEvent }
+      from 'https://esm.sh/@pipecat-ai/client-js@1.10.0';
+    import { SmallWebRTCTransport }
+      from 'https://esm.sh/@pipecat-ai/small-webrtc-transport@1.10.3';
+
+    const statusBar      = document.getElementById('status-bar');
+    const wordProgress   = document.getElementById('word-progress');
+    const scoreValue     = document.getElementById('score-value');
+    const connectBtn     = document.getElementById('connect-btn');
+    const muteBtn        = document.getElementById('mute-btn');
+    const disconnectBtn  = document.getElementById('disconnect-btn');
+    const finishedBanner = document.getElementById('finished-banner');
+    const speakingDot    = document.getElementById('speaking-dot');
+    const speakingLabel  = document.getElementById('speaking-label');
+    const botAudio       = document.getElementById('bot-audio');
+
+    let client = null;
+    let muted  = false;
+
+    function setStatus(t) { statusBar.textContent = t; }
+    function setSpeaking(who) {
+      speakingDot.className   = who;
+      speakingLabel.textContent =
+        who === 'bot'  ? 'Bot is speaking'  :
+        who === 'user' ? 'You are speaking' : '–';
+    }
+    function applyGameState({ score, wordNumber, totalWords, finished }) {
+      wordProgress.textContent = `${wordNumber} / ${totalWords}`;
+      scoreValue.textContent   = `${score} / ${totalWords}`;
+      if (finished) {
+        finishedBanner.style.display = 'block';
+        finishedBanner.textContent   = `🎉 Game over! You scored ${score} out of ${totalWords}.`;
+      }
+    }
+
+    connectBtn.addEventListener('click', async () => {
+      connectBtn.disabled = true;
+      setStatus('Connecting…');
+      finishedBanner.style.display = 'none';
+      wordProgress.textContent = '– / –';
+      scoreValue.textContent   = '–';
+
+      try {
+        const transport = new SmallWebRTCTransport({ waitForICEGathering: true });
+
+        // PipecatClient constructor: { transport, callbacks?, disconnectOnBotDisconnect? }
+        client = new PipecatClient({ transport });
+
+        client.on(RTVIEvent.Connected, () => {
+          setStatus('Connected — listening…');
+          muteBtn.disabled       = false;
+          disconnectBtn.disabled = false;
+        });
+
+        client.on(RTVIEvent.Disconnected, () => {
+          setStatus('Disconnected');
+          muteBtn.disabled       = true;
+          disconnectBtn.disabled = true;
+          connectBtn.disabled    = false;
+          setSpeaking('');
+          client = null;
+        });
+
+        client.on(RTVIEvent.BotReady, () => setStatus('Bot ready — spell away!'));
+
+        client.on(RTVIEvent.BotStartedSpeaking, () => setSpeaking('bot'));
+        client.on(RTVIEvent.BotStoppedSpeaking,  () => setSpeaking(''));
+        client.on(RTVIEvent.UserStartedSpeaking, () => setSpeaking('user'));
+        client.on(RTVIEvent.UserStoppedSpeaking,  () => setSpeaking(''));
+
+        // game_state messages from SpellingValidator via RTVIServerMessageFrame
+        client.on(RTVIEvent.ServerMessage, (data) => {
+          if (data?.type === 'game_state') applyGameState(data);
+        });
+
+        // Route bot audio to the hidden <audio> element.
+        // SmallWebRTCTransport calls onTrackStarted(track) with ONE argument —
+        // participant is always undefined in this transport. Check kind instead.
+        client.on(RTVIEvent.TrackStarted, (track) => {
+          if (track && track.kind === 'audio') {
+            botAudio.srcObject = new MediaStream([track]);
+            botAudio.play().catch(console.error);
+          }
+        });
+
+        client.on(RTVIEvent.Error, (err) => {
+          console.error('RTVI error:', err);
+          setStatus(`Error: ${err?.data?.message ?? err}`);
+          connectBtn.disabled = false;
+        });
+
+        // POST /start, get sessionId, then do WebRTC offer to /sessions/{id}/api/offer
+        await client.startBotAndConnect({
+          endpoint: '/start',
+          requestData: { transport: 'webrtc', enableDefaultIceServers: true },
+        });
+
+      } catch (err) {
+        console.error('Connect failed:', err);
+        setStatus(`Failed: ${err?.message ?? String(err)}`);
+        connectBtn.disabled = false;
+        client = null;
+      }
+    });
+
+    muteBtn.addEventListener('click', () => {
+      if (!client) return;
+      muted = !muted;
+      client.enableMic(!muted);   // synchronous
+      muteBtn.textContent = muted ? 'Unmute Mic' : 'Mute Mic';
+    });
+
+    disconnectBtn.addEventListener('click', async () => {
+      if (!client) return;
+      disconnectBtn.disabled = true;
+      await client.disconnect();
+    });
+  </script>
+</body>
+</html>

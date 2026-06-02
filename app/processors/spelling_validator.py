@@ -1,130 +1,234 @@
-"""Custom frame processor: validates a single spelling attempt.
+"""Custom frame processor: validates spelling attempts across multiple rounds.
 
-This is the heart of the assignment — the "custom frame processor" requirement.
-
-Design (Option A: code judges, LLM emotes):
-  * CODE owns the target word (passed in at construction). The LLM never picks
-    the word and never decides correctness — it is purely the excited host voice.
-  * The processor sits right after STT. It watches for the user's FINAL speech
-    transcription, normalizes it into a plain letter string, and compares it to
-    the target word.
-  * It then injects a system message telling the host LLM the verdict and to
-    react + end the game. `run_llm=True` makes the bot actually speak that
-    reaction.
-  * Single round: after the first judged attempt, `_answered` flips to True and
-    further speech is ignored.
-
-Why normalize? STT does not return clean letters. Someone spelling "apple" out
-loud can transcribe as "a p p l e", "ay pee pee el ee", "A-P-P-L-E", or even
-"apple" if said fast. normalize_spelling() collapses all of those to "apple".
+Design:
+  * CODE owns correctness judgment — the LLM never decides.
+  * On each user TranscriptionFrame (final STT result):
+      1. If the verdict phase is active (_awaiting_verdict), consume silently.
+      2. Otherwise run _extract_spelling — if no valid run found, pass to LLM.
+      3. If a valid spelling is extracted: judge, advance game, push
+         RTVIServerMessageFrame, inject LLMMessagesAppendFrame verdict,
+         and enter verdict phase.
+  * _awaiting_verdict is True from the moment of judgment until BotStoppedSpeakingFrame
+    arrives, preventing Deepgram's segmented transcriptions (multiple final frames for
+    one slow spelling) from being double-judged or causing the LLM to fire twice.
+  * BotStartedSpeakingFrame and BotStoppedSpeakingFrame are broadcast both upstream
+    and downstream by transport.output(), so the validator (which is upstream of TTS)
+    does see them.
 """
 
 import re
 
 from loguru import logger
 
-from pipecat.frames.frames import Frame, TranscriptionFrame, LLMMessagesAppendFrame
-from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    Frame,
+    InterimTranscriptionFrame,
+    LLMMessagesAppendFrame,
+    TranscriptionFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
 
-
-# Spoken letter-names that STT often transcribes as whole words, mapped back
-# to the single letter they represent.
-PHONETIC_LETTERS = {
-    "ay": "a", "bee": "b", "see": "c", "sea": "c", "dee": "d", "ee": "e",
-    "eff": "f", "gee": "g", "aitch": "h", "haitch": "h", "eye": "i",
-    "jay": "j", "kay": "k", "el": "l", "ell": "l", "em": "m", "en": "n",
-    "oh": "o", "owe": "o", "pee": "p", "cue": "q", "queue": "q", "ar": "r",
-    "are": "r", "ess": "s", "tee": "t", "tea": "t", "you": "u", "yoo": "u",
-    "vee": "v", "ex": "x", "why": "y", "zee": "z", "zed": "z",
-}
-
-
-def normalize_spelling(transcript: str) -> str:
-    """Convert a spoken-spelling transcript into a bare lowercase letter string.
-
-    "A-P-P-L-E"        -> "apple"
-    "a p p l e"        -> "apple"
-    "ay pee pee el ee" -> "apple"
-    "it's apple"       -> "apple"   (they just said the word)
-    """
-    text = transcript.lower().strip()
-    tokens = re.split(r"[\s\-.,]+", text)
-
-    letters = []
-    for tok in tokens:
-        tok = tok.strip()
-        if not tok:
-            continue
-        if len(tok) == 1 and tok.isalpha():
-            letters.append(tok)
-        elif tok in PHONETIC_LETTERS:
-            letters.append(PHONETIC_LETTERS[tok])
-        elif tok.isalpha():
-            # A whole word slipped through; treat its characters as the spelling.
-            letters.extend(list(tok))
-    return "".join(letters)
+from app.game.state import SpellBeeGame
 
 
 class SpellingValidator(FrameProcessor):
-    """Judges one spelling attempt for `target_word`, then ends the round."""
+    """Judges spelling attempts against the current SpellBeeGame word.
 
-    def __init__(self, target_word: str, **kwargs):
+    One attempt per word: once a valid spelling is extracted, the game advances,
+    and no further transcriptions are judged until the bot finishes speaking the
+    verdict (BotStoppedSpeakingFrame resets the verdict phase).
+    """
+
+    # Spoken letter-names that STT often transcribes as whole words, mapped to
+    # the single letter they represent. Includes regional variants (e.g. zee/zed
+    # for Z, aitch/haitch for H).
+    _PHONETIC_LETTERS: dict[str, str] = {
+        "ay": "a", "bee": "b", "see": "c", "sea": "c", "dee": "d", "ee": "e",
+        "eff": "f", "gee": "g", "aitch": "h", "haitch": "h", "eye": "i",
+        "jay": "j", "kay": "k", "el": "l", "ell": "l", "em": "m", "en": "n",
+        "oh": "o", "owe": "o", "pee": "p", "cue": "q", "queue": "q", "ar": "r",
+        "are": "r", "ess": "s", "tee": "t", "tea": "t", "you": "u", "yoo": "u",
+        "vee": "v", "ex": "x", "why": "y", "zee": "z", "zed": "z",
+    }
+
+    # Minimum consecutive letter-like tokens to be considered a spelling attempt.
+    # Matches the length of the shortest word in the game ("cat", "dog" = 3).
+    # Raising this protects against isolated phonetic pronouns ("you"→u, "I"→i)
+    # accidentally forming short strings in conversational sentences.
+    _MIN_SPELLING_LETTERS: int = 3
+
+    def __init__(self, game: SpellBeeGame, **kwargs):
         super().__init__(**kwargs)
-        self._target = target_word.lower()
-        self._answered = False
+        self._game = game
+        # True while the bot's TTS audio is playing. Any transcription that
+        # arrives during bot speech is an interruption or ambient echo — drop it.
+        self._bot_is_speaking = False
+        # True from the moment of judgment until bot speech ends. Prevents
+        # Deepgram's segmented transcriptions from double-judging one spelling.
+        self._awaiting_verdict = False
+
+    # ------------------------------------------------------------------ #
+    # Frame processing
+    # ------------------------------------------------------------------ #
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        # Only act on the user's FINAL transcription, and only once.
-        is_attempt = (
-            isinstance(frame, TranscriptionFrame)
-            and getattr(frame, "finalized", True)
-            and not self._answered
-        )
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_is_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_is_speaking = False
+            self._awaiting_verdict = False
+        elif isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+            self._log_stt(frame)
+            if isinstance(frame, TranscriptionFrame) and not self._game.is_finished():
+                await self._handle_transcription(frame, direction)
+                return
 
-        if not is_attempt:
-            await self.push_frame(frame, direction)
+        await self.push_frame(frame, direction)
+
+    async def _handle_transcription(self, frame: TranscriptionFrame, direction: FrameDirection):
+        """Route a final transcription: drop, pass to LLM, or judge as spelling."""
+        if self._bot_is_speaking or self._awaiting_verdict:
+            reason = "bot speaking" if self._bot_is_speaking else "verdict pending"
+            logger.debug(f"[SpellingValidator] {reason}, dropping: '{frame.text}'")
             return
 
-        guess = normalize_spelling(frame.text)
-
-        # Empty/garbled guess: let it pass so the host can ask them to try again,
-        # and do NOT mark the round answered.
+        guess = self._extract_spelling(frame.text)
         if not guess:
-            logger.debug(f"[SpellingValidator] empty guess from '{frame.text}'")
+            logger.debug(f"[SpellingValidator] not a spelling attempt, passing: '{frame.text}'")
             await self.push_frame(frame, direction)
             return
 
-        correct = guess == self._target
-        spaced = "-".join(self._target.upper())
-        logger.info(
-            f"[SpellingValidator] target='{self._target}' guess='{guess}' "
-            f"correct={correct}"
+        await self._judge(guess, direction)
+
+    async def _judge(self, guess: str, direction: FrameDirection):
+        """Record the result, advance the game, and emit verdict frames."""
+        target = self._game.current_word()
+        correct = guess == target
+
+        logger.info(f"[SpellingValidator] word={target!r} guess={guess!r} correct={correct}")
+
+        self._awaiting_verdict = True
+        self._game.record_result(correct)
+        self._game.advance()
+
+        await self._push_game_state()
+        await self._push_verdict(target, guess, correct)
+
+    async def _push_game_state(self):
+        """Send current game state to the browser via RTVI."""
+        await self.push_frame(
+            RTVIServerMessageFrame(
+                data={
+                    "type": "game_state",
+                    "score": self._game.score,
+                    "wordNumber": self._game.word_number,
+                    "totalWords": self._game.total_words,
+                    "finished": self._game.is_finished(),
+                }
+            ),
+            FrameDirection.DOWNSTREAM,
         )
 
-        if correct:
-            verdict = (
-                f"The player spelled '{self._target}' correctly. "
-                "Congratulate them enthusiastically, then warmly end the game."
-            )
-        else:
-            verdict = (
-                f"The player spelled '{self._target}' incorrectly "
-                f"(they said '{guess.upper()}'). Kindly tell them the correct "
-                f"spelling is {spaced}, encourage them, then warmly end the game."
-            )
-
-        self._answered = True
-
-        # Inject the verdict as a system instruction and trigger the bot to speak.
-        # We CONSUME the original transcription (do not push it) so the raw
-        # letters don't separately drive the LLM — this injected message is the
-        # single, code-controlled trigger for the bot's reaction.
+    async def _push_verdict(self, target: str, guess: str, correct: bool):
+        """Inject the verdict instruction into the LLM context and trigger a response."""
         await self.push_frame(
             LLMMessagesAppendFrame(
-                messages=[{"role": "system", "content": verdict}],
+                messages=[{"role": "system", "content": self._build_verdict(target, guess, correct)}],
                 run_llm=True,
             ),
             FrameDirection.DOWNSTREAM,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _log_stt(frame: TranscriptionFrame | InterimTranscriptionFrame) -> None:
+        label = "STT-final" if isinstance(frame, TranscriptionFrame) else "STT-interim"
+        logger.info(f"[{label}] '{frame.text}'")
+
+    def _extract_spelling(self, transcript: str) -> str:
+        """Extract the letter-by-letter spelling from a transcript.
+
+        Only CONSECUTIVE runs of letter-like tokens (single chars or phonetic
+        letter-names) are considered. Whole words are skipped, so isolated
+        pronouns like "I" or "you" that happen to be phonetic names for letters
+        never form a valid spelling on their own.
+
+        Returns the longest consecutive run if it is at least _MIN_SPELLING_LETTERS
+        long; otherwise returns "".
+
+        "a p p l e"                 -> "apple"
+        "ay pee pee el ee"          -> "apple"
+        "the spelling is a p p l e" -> "apple"  (preamble breaks before the run)
+        "apple"                     -> ""       (whole word → skipped)
+        "can you repeat the word again? I did not get it."
+                                    -> ""       ('you'→u and 'I'→i are isolated)
+        """
+        tokens = re.split(r"[\s\-.,?!\'\"]+", transcript.lower().strip())
+
+        best_run: list[str] = []
+        current_run: list[str] = []
+
+        for tok in tokens:
+            tok = tok.strip()
+            if not tok:
+                continue
+            if len(tok) == 1 and tok.isalpha():
+                current_run.append(tok)
+            elif tok in self._PHONETIC_LETTERS:
+                current_run.append(self._PHONETIC_LETTERS[tok])
+            else:
+                if len(current_run) > len(best_run):
+                    best_run = current_run
+                current_run = []
+
+        if len(current_run) > len(best_run):
+            best_run = current_run
+
+        result = "".join(best_run)
+        return result if len(result) >= self._MIN_SPELLING_LETTERS else ""
+
+    def _build_verdict(self, target: str, guess: str, correct: bool) -> str:
+        """Build the system instruction sent to the LLM after each judgment.
+
+        Called after record_result() and advance() so self._game reflects the
+        new position (is_finished() and current_word() are already updated).
+        """
+        spaced = "-".join(target.upper())
+        score = self._game.score
+        total = self._game.total_words
+
+        if self._game.is_finished():
+            if correct:
+                return (
+                    f"The player spelled '{target}' correctly! "
+                    f"The game is over. They scored {score} out of {total}. "
+                    f"Celebrate enthusiastically and wrap up warmly."
+                )
+            return (
+                f"The player spelled '{target}' incorrectly "
+                f"(they said '{guess.upper()}', correct spelling is {spaced}). "
+                f"The game is over. They scored {score} out of {total}. "
+                f"Be encouraging and wrap up warmly."
+            )
+
+        next_word = self._game.current_word()
+        if correct:
+            return (
+                f"The player spelled '{target}' correctly! "
+                f"Congratulate them briefly, then present the next word: '{next_word}'. "
+                f"Ask them to spell it out letter by letter."
+            )
+        return (
+            f"The player spelled '{target}' incorrectly "
+            f"(they said '{guess.upper()}', correct spelling is {spaced}). "
+            f"Be kind, then present the next word: '{next_word}'. "
+            f"Ask them to spell it out letter by letter."
         )
